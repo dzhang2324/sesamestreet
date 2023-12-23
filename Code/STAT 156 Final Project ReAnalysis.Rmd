@@ -1,0 +1,593 @@
+---
+title: "STAT 156 Final Project ReAnalysis"
+output: html_document
+date: "2023-12-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We replicate Table 4a, 5a, and 6a using Doubly Robust (AIPW) estimators. We binarize the treatment $preschool69 \times SSCov$ into an indicator variable which equals 1 if the individual is of preschool age in 1969 and has Sesame Street coverage, but also has above average Sesame Street coverage.
+
+# Load and Prepare Data
+
+```{r}
+#Preparing census80
+census80 = read.table("C:\\Users\\ttrap\\Downloads\\census80.Rda")
+
+census80 = census80 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+#Creating treatment indicator. Equals 1 if preschlcov is above average
+census80 = census80 %>% 
+  mutate(above_avg_preschlcov = ifelse(preschlcov > mean(preschlcov, na.rm = TRUE), 1, 0))
+```
+
+```{r}
+#Preparing census70
+census70 = read.table("C:\\Users\\ttrap\\Downloads\\census70.Rda")
+census70 = census70 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+#Creating treatment indicator. Equals 1 if preschlcov is above average
+census70 = census70 %>% 
+  mutate(above_avg_preschlcov = ifelse(preschlcov > mean(preschlcov, na.rm = TRUE), 1, 0))
+```
+
+```{r}
+#Preparing census90 and census2000
+census90 = read.table("C:\\Users\\ttrap\\Downloads\\census90.Rda")
+census90 = census90 %>% 
+      filter(!is.na(hsdrop), !is.na(hsgrad), !is.na(anycol), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+#Creating treatment indicator. Equals 1 if preschlcov is above average
+census90 = census90 %>% 
+  mutate(above_avg_preschlcov = ifelse(preschlcov > mean(preschlcov, na.rm = TRUE), 1, 0))
+
+census2000 = read.table("C:\\Users\\ttrap\\Downloads\\census2000.Rda")
+census2000 = census2000 %>% 
+      filter(!is.na(lnhrwage), !is.na(working), !is.na(inpov), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+#Creating treatment indicator. Equals 1 if preschlcov is above average
+census2000 = census2000 %>% 
+  mutate(above_avg_preschlcov = ifelse(preschlcov > mean(preschlcov, na.rm = TRUE), 1, 0))
+```
+
+# Load Libraries/Import Functions
+
+```{r}
+library(tidyverse)
+library(plm)
+library(haven)
+library(estimatr)
+library(parallel)
+library(pbapply)
+library(progress)
+library(shiny)
+```
+
+```{r}
+#From Chapter 12 of the textbook
+
+## Chapter 12.3.1
+#z - vector of treatment assignment
+#x - matrix of covariates
+#y - vector of outcomes of interest
+doubly_robust = function(z, y, x, out.family = gaussian, 
+                  truncps = c(0, 1))
+{
+     ## fitted propensity score
+     pscore   = glm(z ~ x, family = binomial)$fitted.values
+     pscore   = pmax(truncps[1], pmin(truncps[2], pscore))
+     
+     ## fitted potential outcomes
+     outcome1 = glm(y ~ x, weights = z, 
+                    family = out.family)$fitted.values
+     outcome0 = glm(y ~ x, weights = (1 - z), 
+                    family = out.family)$fitted.values
+     
+     ace.reg  = mean(outcome1 - outcome0) 
+     
+     ## doubly robust estimator
+     res1      = y - outcome1
+     res0      = y - outcome0
+     r.treat   = mean(z*res1/pscore)
+     r.control = mean((1 - z)*res0/(1 - pscore))
+     ace.dr    = ace.reg + r.treat - r.control
+
+  return(ace.dr)   
+}
+```
+
+```{r}
+#Function to get a clustered subsample
+cluster_subsample <- function(data, cluster_variable, n) {
+  
+  #Empty dataframe to put samples
+  subsample <- data.frame()
+  
+  #Calculate proportion of each cluster
+  cluster_proportions = table(data[[cluster_variable]])/nrow(data)
+  
+  for (cluster in unique(data[[cluster_variable]])) {
+  
+  #Calculate cluster size to sample, round to nearest integer
+  p_k = cluster_proportions[[as.character(cluster)]]
+  cluster_size = round(p_k * n)
+  
+  #Filter for observations in cluster
+  cluster_data <- filter(data, !!sym(cluster_variable) == cluster)
+  
+  # Sample from the current cluster
+  sampled_data <- cluster_data[sample(nrow(cluster_data), cluster_size, replace = TRUE), ]
+  
+  # Append the sampled data to the subsample
+  subsample <- rbind(subsample, sampled_data)
+  }
+  
+  return(subsample)
+}
+```
+
+We slightly modify the bootstrapping function. 
+
+```{r}
+bootstrap_table4_DR = function(census, n) {
+    
+    #Initialize empty vector to put DR_est
+    #1: all, 2: male, 3: female, 4: white, 5: black, 6: hispanic
+    coef_vec = numeric(length = 6)
+    
+    #Take subsample of census
+    census_sample = cluster_subsample(census, "dmaindex", n)
+    
+    #Define groups for regressions
+    groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+    group_names = names(groups)
+    
+    for (i in seq_along(group_names)) {
+      group_name = group_names[i]
+      group_condition <- groups[[group_name]]
+      
+      group_data = census_sample %>%
+        filter(!!group_condition)
+      
+      #Randomly permute above_avg_preschlcov, same as randomly permuting covratehat and recalculating
+      group_data[["above_avg_preschlcov"]] = sample(group_data[["above_avg_preschlcov"]])
+      
+      #Doubly Robust estimation
+      #We truncate to 95%
+      DR_est = doubly_robust(z = group_data$above_avg_preschlcov, y = group_data$gradeage, 
+                             x = as.matrix(group_data[, controls]), truncps = c(0.05, 0.95))
+      coef_vec[i] = DR_est
+      
+    }
+  return(coef_vec)
+}
+```
+
+# Table 4a
+
+## Initial DR Estimates
+
+```{r}
+#Defining control variables and empty matrices to store coefficients
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+#census4a_DR = matrix(NA, nrow = 4, ncol = 6)
+```
+
+
+```{r}
+groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+group_names = names(groups)
+
+for (i in 1:6) {
+  group_name = group_names[i]
+  group_condition <- groups[[group_name]]
+  
+  group_data = filter(census80, !!group_condition)
+  
+  # Estimate the FE model
+  DR_est = doubly_robust(z = group_data$above_avg_preschlcov, y = group_data$gradeage, x = as.matrix(group_data[, controls]), truncps = c(0.05, 0.95))
+  
+  census4a_DR[1, i] <- DR_est
+  census4a_DR[3, i] <- nrow(group_data)
+  census4a_DR[4, i] <- mean(group_data$above_avg_preschlcov)
+}
+```
+
+## Table 4a Bootstrap
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table4_DR(census80, n = 30000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create a single matrix this time
+
+#Indices of DR estimates corresponds to
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+table4a_DR_mat <- do.call(rbind, result_list)
+
+elapsed_time
+```
+
+```{r}
+#Set the second row to the standard error vector
+table4a_DR_se = apply(table4a_DR_mat, 2, sd)
+
+census4a_DR[2, ] = table4a_DR_se
+```
+
+
+# Table 5a
+
+## Initial DR Estimates
+
+```{r}
+#Defining control variables and empty matrices to store coefficients
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+
+#census5a_DR <- matrix(NA, nrow = 4, ncol = 6)
+```
+
+```{r}
+groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+group_names = names(groups)
+
+for (i in 1:6) {
+  group_name = group_names[i]
+  group_condition <- groups[[group_name]]
+  
+  group_data = filter(census70, !!group_condition)
+  
+  # Estimate the FE model
+  DR_est = doubly_robust(z = group_data$above_avg_preschlcov, y = group_data$gradeage, x = as.matrix(group_data[, controls]), truncps = c(0.05, 0.95))
+  
+  census5a_DR[1, i] <- DR_est
+  census5a_DR[3, i] <- nrow(group_data)
+  census5a_DR[4, i] <- mean(group_data$above_avg_preschlcov)
+}
+```
+
+## Table 5a Bootstrap
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table4_DR(census70, n = 30000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create a single matrix this time
+
+#Indices of DR estimates corresponds to
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+table5a_DR_mat <- do.call(rbind, result_list)
+
+elapsed_time
+```
+
+```{r}
+table5a_DR_se = apply(table5a_DR_mat, 2, sd)
+
+census5a_DR[2, ] = table5a_DR_se
+```
+
+# Table 6a
+
+## Initial DR Estimates
+
+```{r}
+#census6a_DR <- matrix(NA, nrow = 4, ncol = 6)
+```
+
+```{r}
+controls902000 = c("blacknh", 'othernh', 'hispanic', 
+                  'female', 'hspercap', 'start66', 'start67', 'start68', 'start69', 
+                  'start70', 'start71', 'start72', 'start73', 'start74')
+```
+
+```{r}
+outcomes90 = c("hsdrop", "hsgrad", "anycol")
+
+for (i in 1:3) {
+  
+  #DR Estimate
+  DR_est = doubly_robust(z = census90$above_avg_preschlcov, y = census90[[outcomes90[i]]], x = as.matrix(census90[, controls902000]), truncps = c(0.05, 0.95))
+  
+  census6a_DR[1, i] <- DR_est
+  census6a_DR[3, i] <- nrow(census90)
+  census6a_DR[4, i] <- mean(census90$above_avg_preschlcov)
+}
+
+outcomes2000 = c('lnhrwage', 'working', 'inpov')
+
+for (i in 1:3) {
+  
+  #DR Estimate
+  DR_est = doubly_robust(z = census2000$above_avg_preschlcov, y = census2000[[outcomes2000[i]]], x = as.matrix(census2000[, controls902000]), truncps = c(0.05, 0.95))
+  
+  census6a_DR[1, i + 3] <- DR_est
+  census6a_DR[3, i + 3] <- nrow(census2000)
+  census6a_DR[4, i + 3] <- mean(census2000$above_avg_preschlcov)
+}
+```
+
+## Modified Bootstrap Function
+
+```{r}
+bootstrap_table6_DR = function(census, n, outcomes) {
+    
+    #Initialize empty vector to put DR_est
+    #1: outcomes[1], #2: outcomes[2], #3: outcomes[3]
+    coef_vec = numeric(length = 3)
+    
+    #Take subsample of census
+    census_sample = cluster_subsample(census, "dmaindex", n)
+    
+    #Define groups for regressions
+    outcomes_iter = outcomes
+    
+    for (i in 1:3) {
+      
+      #Randomly permute above_avg_preschlcov, same as randomly permuting covratehat and recalculating
+      census_sample[["above_avg_preschlcov"]] = sample(census_sample[["above_avg_preschlcov"]])
+      
+      #Doubly Robust estimation
+      #We truncate to 95%
+      DR_est = doubly_robust(z = census_sample$above_avg_preschlcov, y = census_sample[[outcomes_iter[i]]], 
+                             x = as.matrix(census_sample[, controls902000]), truncps = c(0.05, 0.95))
+      coef_vec[i] = DR_est
+      
+    }
+  return(coef_vec)
+}
+```
+
+## census90 Bootstrap
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table6_DR(census90, n = 30000, outcomes90)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create a single matrix this time
+
+#Indices of DR estimates corresponds to
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+table6a_DR_mat_90 <- do.call(rbind, result_list)
+
+elapsed_time
+```
+
+```{r}
+table6a_DR_se_90 = apply(table6a_DR_mat_90, 2, sd)
+
+census6a_DR[2, 1:3] = table6a_DR_se_90
+```
+
+## census2000 Bootstrap
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table6_DR(census2000, n = 30000, outcomes2000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create a single matrix this time
+
+#Indices of DR estimates corresponds to
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+table6a_DR_mat_2000 <- do.call(rbind, result_list)
+
+elapsed_time
+```
+
+```{r}
+table6a_DR_se_2000 = apply(table6a_DR_mat_2000, 2, sd)
+
+census6a_DR[2, 4:6] = table6a_DR_se_2000
+```
+
+# Making LaTeX Tables
+
+## Table 4a
+
+```{r}
+census4a_table_DR <- xtable(census4a_DR, digits = 3)
+
+# Print LaTeX code
+print(census4a_table_DR, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+## Table 5a
+
+```{r}
+census5a_table_DR <- xtable(census5a_DR, digits = 3)
+
+# Print LaTeX code
+print(census5a_table_DR, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+## Table 6a
+
+```{r}
+census6a_table_DR <- xtable(census6a_DR, digits = 3)
+
+# Print LaTeX code
+print(census6a_table_DR, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

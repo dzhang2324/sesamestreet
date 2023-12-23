@@ -1,0 +1,722 @@
+---
+title: "STAT 156 Table Replication (Alternative Bootstrap)"
+output: html_document
+date: "2023-12-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Libraries
+
+```{r}
+library(tidyverse)
+library(plm)
+library(haven)
+library(estimatr)
+library(parallel)
+library(pbapply)
+library(progress)
+library(shiny)
+```
+
+# Bootstrap compromise
+
+Due to computational restraints, we have to do subsample clustered bootstrapping. Although there may be asymptotic results published somewhere, the results are unknown to us, and are somewhat out of scope of this replication. Nonetheless, we proceed with the following algorithm:
+
+1.  Choose a total sample size $n$ (we will choose $n = 10,000$).
+2.  Calculate the proportions of data points in each cluster, denoted as $p_k$.
+3.  For each cluster $k$, randomly sample with replacement $p_kn$ data points, rounding up to the nearest integer.
+4.  Proceed with the bootstrapping/estimation procedure as usual.
+
+
+Since we cannot exactly replicate the bootstrap procedure due to computational restraints, we will attempt to replicate some degree of randomness coming from the coverage simulation by randomly permuting the simulated coverage within bootstrap sample, then calculating coverage variables.
+
+```{r}
+#Function to get a clustered subsample
+cluster_subsample <- function(data, cluster_variable, n) {
+  
+  #Empty dataframe to put samples
+  subsample <- data.frame()
+  
+  #Calculate proportion of each cluster
+  cluster_proportions = table(data[[cluster_variable]])/nrow(data)
+  
+  for (cluster in unique(data[[cluster_variable]])) {
+  
+  #Calculate cluster size to sample, round to nearest integer
+  p_k = cluster_proportions[[as.character(cluster)]]
+  cluster_size = round(p_k * n)
+  
+  #Filter for observations in cluster
+  cluster_data <- filter(data, !!sym(cluster_variable) == cluster)
+  
+  # Sample from the current cluster
+  sampled_data <- cluster_data[sample(nrow(cluster_data), cluster_size, replace = TRUE), ]
+  
+  # Append the sampled data to the subsample
+  subsample <- rbind(subsample, sampled_data)
+  }
+  
+  return(subsample)
+}
+```
+
+
+# Table 4
+
+```{r}
+#Preparing census80
+census80 = read.table("C:\\Users\\ttrap\\Downloads\\census80.Rda")
+
+census80 = census80 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+### Initial Regression Results
+
+```{r}
+#Defining control variables and empty matrices to store coefficients
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+
+census4a <- matrix(NA, nrow = 4, ncol = 6)
+census4b <- matrix(NA, nrow = 9, ncol = 6)
+```
+
+```{r}
+groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+group_names = names(groups)
+
+for (i in 1:6) {
+  group_name = group_names[i]
+  group_condition <- groups[[group_name]]
+  
+  group_data = filter(census80, !!group_condition)
+  
+  # Estimate the FE model
+  model_1 <- plm(as.formula(paste("gradeage ~ preschlcov +", paste(controls, collapse = " + "))), 
+                   data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census4a[1, i] <- coef(model_1)["preschlcov"]
+  census4a[3, i] <- nrow(group_data)
+  census4a[4, i] <- mean(group_data$gradeage)
+  
+  model_2 <- plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), 
+                 data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census4b[1, i] <- coef(model_2)["covst6768"]
+  census4b[3, i] <- coef(model_2)["covst69"]
+  census4b[5, i] <- coef(model_2)["covst7072"]
+  census4b[7, i] <- coef(model_2)["covst7374"]
+  census4b[9, i] <- nrow(group_data)
+}
+```
+
+### Table 4 Bootstrap
+
+```{r}
+bootstrap_table4 = function(census, n) {
+    
+    #Initialize empty list to put coef_vecs
+    #1: all, 2: male, 3: female, 4: white, 5: black, 6: hispanic
+    coef_list = list()
+    
+    #Take subsample of census
+    census_sample = cluster_subsample(census, "dmaindex", n)
+    
+    #Define groups for regressions
+    groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+    group_names = names(groups)
+    
+    for (i in 1:6) {
+      group_name = group_names[i]
+      group_condition <- groups[[group_name]]
+      
+      group_data = census_sample %>%
+        filter(!!group_condition)
+      
+      #Randomly permute covratehat
+      group_data[["covratehat"]] = sample(group_data[["covratehat"]])
+    
+      #Recalculate coverage variables
+      years <- 65:74
+      for (yr in years) {
+      start_col <- paste("start", yr, sep = "")
+      covstyr_col <- paste("covst", yr, sep = "")
+      group_data[[covstyr_col]] <- group_data$covratehat * group_data[[start_col]]
+      }
+    
+      group_data = group_data %>% 
+        mutate(covst6768 = covratehat*start6768, 
+               covst7072 = covratehat*start7072,
+               covst7374 = covratehat*start7374)
+      
+      
+      #Estimate regressions
+      model_1 <- plm(as.formula(paste("gradeage ~ preschlcov +", paste(controls, collapse = " + "))), 
+                   data = group_data, index = c("statecty", "statecohort"), model = "within")
+      
+      model_2 <- plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+      coef_vec = c(coef(model_1)["preschlcov"][1], coef(model_2)["covst6768"][1], coef(model_2)["covst69"][1], 
+               coef(model_2)["covst7072"][1], coef(model_2)["covst7374"][1])
+      
+      #Add coef_vec to list
+      coef_list[[i]] = coef_vec
+      
+    }
+  return(coef_list)
+}
+```
+
+```{r}
+#Test run, it works!
+#bootstrap_table4(census80, 20000)
+```
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table4(census80, n = 30000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create matrices
+
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+combined_matrices_table4 <- lapply(seq_along(result_list[[1]]), function(j) {
+     do.call(rbind, lapply(result_list, function(rep_result) rep_result[[j]]))
+})
+
+elapsed_time
+```
+
+```{r}
+#Create vectors of bootstrapped S.E. to put into census4a and census4b
+
+std_dev_list_table4 <- lapply(combined_matrices_table4, function(mat) apply(mat, 2, sd))
+
+std_dev_matrix_table4 <- do.call(rbind, std_dev_list_table4)
+
+std_dev_matrix_table4
+```
+
+```{r}
+#Setting second row of census4a to the 1st column of std_dev_matrix_table4
+census4a[2, ] = std_dev_matrix_table4[, 1]
+
+#Setting all empty rows in census4b to respective std_dev columns
+census4b[2, ] = std_dev_matrix_table4[, 2]
+census4b[4, ] = std_dev_matrix_table4[, 3]
+census4b[6, ] = std_dev_matrix_table4[, 4]
+census4b[8, ] = std_dev_matrix_table4[, 5]
+```
+
+
+# Table 5
+
+The process for table 5 follows the same process as table 4. The only thing that changes is the data. 
+
+```{r}
+census70 = read.table("C:\\Users\\ttrap\\Downloads\\census70.Rda")
+census70 = census70 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+### Initial Regression Results
+
+```{r}
+#Defining control variables and empty matrices to store coefficients
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+
+census5a <- matrix(NA, nrow = 4, ncol = 6)
+census5b <- matrix(NA, nrow = 9, ncol = 6)
+```
+
+```{r}
+groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+group_names = names(groups)
+
+for (i in 1:6) {
+  group_name = group_names[i]
+  group_condition <- groups[[group_name]]
+  
+  group_data = filter(census70, !!group_condition)
+  
+  # Estimate the FE model
+  model_1 <- plm(as.formula(paste("gradeage ~ preschlcov +", paste(controls, collapse = " + "))), 
+                   data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census5a[1, i] <- coef(model_1)["preschlcov"]
+  census5a[3, i] <- nrow(group_data)
+  census5a[4, i] <- mean(group_data$gradeage)
+  
+  model_2 <- plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), 
+                 data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census5b[1, i] <- coef(model_2)["covst6768"]
+  census5b[3, i] <- coef(model_2)["covst69"]
+  census5b[5, i] <- coef(model_2)["covst7072"]
+  census5b[7, i] <- coef(model_2)["covst7374"]
+  census5b[9, i] <- nrow(group_data)
+}
+```
+
+### Table 5 Bootstrap
+
+```{r}
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps
+)
+
+# Suppress warnings for bootstrap_table4
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table4(census70, n = 30000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create matrices
+
+#1: All, 2: Boys, 3: Girls, 4: White, 5: Black, 6: Hispanic
+combined_matrices_table5 <- lapply(seq_along(result_list[[1]]), function(j) {
+     do.call(rbind, lapply(result_list, function(rep_result) rep_result[[j]]))
+})
+
+elapsed_time
+```
+
+```{r}
+#Create vectors of bootstrapped S.E. to put into census5a and census5b
+
+std_dev_list_table5 <- lapply(combined_matrices_table5, function(mat) apply(mat, 2, sd))
+
+std_dev_matrix_table5 <- do.call(rbind, std_dev_list_table5)
+
+std_dev_matrix_table5
+```
+
+```{r}
+#Setting second row of census4a to the 1st column of std_dev_matrix_table4
+census5a[2, ] = std_dev_matrix_table5[, 1]
+
+#Setting all empty rows in census4b to respective std_dev columns
+census5b[2, ] = std_dev_matrix_table5[, 2]
+census5b[4, ] = std_dev_matrix_table5[, 3]
+census5b[6, ] = std_dev_matrix_table5[, 4]
+census5b[8, ] = std_dev_matrix_table5[, 5]
+```
+
+
+# Table 6
+
+The process for Table 6 is slightly different, so we will slightly modify the process, since Table 6 uses 2 datasets, and runs two separate regression processes.
+
+Table 6 does not filter by groups: instead, it estimates effects on multiple outcomes.
+Table 6 also uses slightly different controls. 
+
+```{r}
+#First 3 columns are results for census90, last 3 are for census2000
+census6a <- matrix(NA, nrow = 4, ncol = 6)
+census6b <- matrix(NA, nrow = 9, ncol = 6)
+```
+
+## Loading Data
+
+```{r}
+census90 = read.table("C:\\Users\\ttrap\\Downloads\\census90.Rda")
+census90 = census90 %>% 
+      filter(!is.na(hsdrop), !is.na(hsgrad), !is.na(anycol), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+census2000 = read.table("C:\\Users\\ttrap\\Downloads\\census2000.Rda")
+census2000 = census2000 %>% 
+      filter(!is.na(lnhrwage), !is.na(working), !is.na(inpov), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+### Initial Regression Results
+
+```{r}
+controls902000 = c("blacknh", 'othernh', 'hispanic',
+                  'female', 'hspercap', 'start66', 'start67', 'start68', 'start69', 
+                  'start70', 'start71', 'start72', 'start73', 'start74')
+```
+
+i from 1-3 uses census90, i from 4-6 uses census2000
+
+```{r}
+outcomes90 = c("hsdrop", "hsgrad", "anycol")
+
+for (i in 1:3) {
+  
+  # Estimate the FE model
+  model_1 <- plm(as.formula(paste(outcomes90[i], paste("~ preschlcov +", paste(controls902000, collapse = " + ")))), data = census90, index = c("statecty", "statecohort"), model = "within")
+  
+  census6a[1, i] <- coef(model_1)["preschlcov"]
+  census6a[3, i] <- nrow(census90)
+  census6a[4, i] <- mean(census90[[outcomes90[i]]])
+  
+  model_2 <- plm(as.formula(paste(outcomes90[i], paste("~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls902000, collapse = " + ")))), data = census90, index = c("statecty", "statecohort"), model = "within")
+  
+  census6b[1, i] <- coef(model_2)["covst6768"]
+  census6b[3, i] <- coef(model_2)["covst69"]
+  census6b[5, i] <- coef(model_2)["covst7072"]
+  census6b[7, i] <- coef(model_2)["covst7374"]
+  census6b[9, i] <- nrow(census90)
+}
+
+outcomes2000 = c('lnhrwage', 'working', 'inpov')
+
+for (i in 1:3) {
+  
+  # Estimate the FE model
+  model_1 <- plm(as.formula(paste(outcomes2000[i], paste("~ preschlcov +", paste(controls902000, collapse = " + ")))), data = census2000, index = c("statecty", "statecohort"), model = "within")
+  
+  census6a[1, i + 3] <- coef(model_1)["preschlcov"]
+  census6a[3, i + 3] <- nrow(census2000)
+  census6a[4, i + 3] <- mean(census2000[[outcomes2000[i]]])
+  
+  model_2 <- plm(as.formula(paste(outcomes2000[i], paste("~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls902000, collapse = " + ")))), data = census2000, index = c("statecty", "statecohort"), model = "within")
+  
+  census6b[1, i + 3] <- coef(model_2)["covst6768"]
+  census6b[3, i + 3] <- coef(model_2)["covst69"]
+  census6b[5, i + 3] <- coef(model_2)["covst7072"]
+  census6b[7, i + 3] <- coef(model_2)["covst7374"]
+  census6b[9, i + 3] <- nrow(census2000)
+}
+```
+
+### Table 6 Bootstrap
+
+This bootstrap is slightly different, since there are slightly different variables. Most importantly, since there are not separate groups to consider, we randomly permute covratehat across the whole census data before we take a sample. 
+
+```{r}
+#Returns a list of 3 vectors, each with 5 coefficients
+#Need to change this so it returns a list of 6 vectors, each with 5 coefficients
+#Meaning that we do both census bootstraps within this function
+
+bootstrap_table6 = function(census, n, outcomes) {
+    
+    #Initialize empty list to put coef_vecs
+    #1: all, 2: male, 3: female, 4: white, 5: black, 6: hispanic
+    coef_list = list()
+    
+    #Randomly permute covratehat before taking sample
+    census[["covratehat"]] = sample(census[["covratehat"]])
+    
+    #Take subsample of census
+    census_sample = cluster_subsample(census, "dmaindex", n)
+    
+    #Define groups for regressions
+    outcomes_iter = outcomes
+    
+    for (i in seq_along(outcomes_iter)) {
+    
+      #Recalculate coverage variables
+      years <- 65:74
+      for (yr in years) {
+      start_col <- paste("start", yr, sep = "")
+      covstyr_col <- paste("covst", yr, sep = "")
+      census_sample[[covstyr_col]] <- census_sample$covratehat * census_sample[[start_col]]
+      }
+    
+      census_sample = census_sample %>% 
+        mutate(covst6768 = covratehat*start6768, 
+               covst7072 = covratehat*start7072,
+               covst7374 = covratehat*start7374)
+      
+      
+      #Estimate regressions
+      model_1 <- plm(as.formula(paste(outcomes_iter[i], paste("~ preschlcov +", paste(controls902000, collapse = " + ")))), data = census_sample, index = c("statecty", "statecohort"), model = "within")
+      
+      model_2 <- plm(as.formula(paste(outcomes_iter[i], paste("~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls902000, collapse = " + ")))), data = census_sample, index = c("statecty", "statecohort"), model = "within")
+  
+      coef_vec = c(coef(model_1)["preschlcov"][1], coef(model_2)["covst6768"][1], coef(model_2)["covst69"][1], 
+               coef(model_2)["covst7072"][1], coef(model_2)["covst7374"][1])
+      
+      #Add coef_vec to list
+      coef_list[[i]] = coef_vec
+      
+    }
+  return(coef_list)
+}
+```
+
+Note that now, we work with two lists of 3 vectors each: one list will correspond to census90, the other corresponds to census2000.
+
+### census90 Bootstrap
+
+```{r}
+# Set a seed for reproducibility
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps * 2  # Update total for two datasets
+)
+
+
+# Suppress warnings for pbreplicate
+# Suppress warnings for bootstrap_table4
+
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table6(census90, n = 30000, outcomes90)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create matrices
+
+#Order of coefficient matrices:
+#1: hsdrop, 2: hsgrad, 3: anycol
+combined_matrices_table6_90 <- lapply(seq_along(result_list[[1]][1:3]), function(j) {
+     do.call(rbind, lapply(result_list, function(rep_result) rep_result[[j]]))
+})
+
+elapsed_time
+```
+
+```{r}
+std_dev_list_table6_90 <- lapply(combined_matrices_table6_90, function(mat) apply(mat, 2, sd))
+
+std_dev_matrix_table6_90 <- do.call(rbind, std_dev_list_table6_90)
+
+std_dev_matrix_table6_90
+```
+
+```{r}
+census6a[2, 1:3] = std_dev_matrix_table6_90[, 1]
+
+census6b[2, 1:3] = std_dev_matrix_table6_90[, 2]
+census6b[4, 1:3] = std_dev_matrix_table6_90[, 3]
+census6b[6, 1:3] = std_dev_matrix_table6_90[, 4]
+census6b[8, 1:3] = std_dev_matrix_table6_90[, 5]
+```
+
+
+### census2000 Bootstrap
+
+```{r}
+# Set a seed for reproducibility
+set.seed(123)
+
+# Set the number of repetitions
+reps <- 200
+
+# Timing the execution of the code
+start_time <- Sys.time()
+
+# Create a progress bar
+pb <- progress_bar$new(
+  format = "[:bar] :percent Elapsed: :elapsed Time Remaining: :eta",
+  total = reps * 2  # Update total for two datasets
+)
+
+
+# Suppress warnings for pbreplicate
+# Suppress warnings for bootstrap_table4
+
+result_list <- pbreplicate(
+  reps,
+  suppressWarnings(bootstrap_table6(census2000, n = 30000, outcomes2000)),
+  simplify = FALSE
+)
+
+# Timing the end of the code
+end_time <- Sys.time()
+
+# Calculate the elapsed time
+elapsed_time <- end_time - start_time
+
+# Combine the vectors across coefficients to create matrices
+
+#Order of coefficient matrices:
+#1: hsdrop, 2: hsgrad, 3: anycol, 4: lnhrwage, 5: working, 6: inpov
+combined_matrices_table6_2000 <- lapply(seq_along(result_list[[1]]), function(j) {
+     do.call(rbind, lapply(result_list, function(rep_result) rep_result[[j]]))
+})
+
+elapsed_time
+```
+
+```{r}
+#Create vectors of bootstrapped S.E. to put into census5a and census5b
+
+std_dev_list_table6_2000 <- lapply(combined_matrices_table6_2000, function(mat) apply(mat, 2, sd))
+
+std_dev_matrix_table6_2000 <- do.call(rbind, std_dev_list_table6_2000)
+
+std_dev_matrix_table6_2000
+```
+
+```{r}
+census6a[2, 4:6] = std_dev_matrix_table6_2000[, 1]
+
+census6b[2, 4:6] = std_dev_matrix_table6_2000[, 2]
+census6b[4, 4:6] = std_dev_matrix_table6_2000[, 3]
+census6b[6, 4:6] = std_dev_matrix_table6_2000[, 4]
+census6b[8, 4:6] = std_dev_matrix_table6_2000[, 5]
+```
+
+
+# Converting Matrices into LaTeX Tables
+
+```{r}
+library(xtable)
+library(stargazer)
+```
+
+### Table 4
+
+```{r}
+# Convert matrix to LaTeX table
+census4a_table <- xtable(census4a, digits = 3)
+
+# Print LaTeX code
+print(census4a_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+```{r}
+# Convert matrix to LaTeX table
+census4b_table <- xtable(census4b, digits = 3)
+
+# Print LaTeX code
+print(census4b_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+```{r}
+stargazer(census4b, title = "My Matrix Table", label = "tab:my_matrix", summary = FALSE)
+```
+
+### Table 5
+
+```{r}
+# Convert matrix to LaTeX table
+census5a_table <- xtable(census5a, digits = 3)
+
+# Print LaTeX code
+print(census5a_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+```{r}
+# Convert matrix to LaTeX table
+census5b_table <- xtable(census5b, digits = 3)
+
+# Print LaTeX code
+print(census5b_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+### Table 6
+
+```{r}
+census6a_table <- xtable(census6a, digits = 3)
+
+# Print LaTeX code
+print(census6a_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+```{r}
+census6b_table <- xtable(census6b, digits = 3)
+
+# Print LaTeX code
+print(census6b_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

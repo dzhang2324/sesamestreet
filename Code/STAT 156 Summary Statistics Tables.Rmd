@@ -1,0 +1,173 @@
+---
+title: "STAT 156 Summary Statistics Tables"
+output: html_document
+date: "2023-12-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(stargazer)
+library(xtable)
+```
+
+# Loading Data
+
+```{r}
+load("C:\\Users\\ttrap\\Downloads\\Summary_Stats (for ccdbcompare and summary tables).RData")
+```
+
+
+```{r}
+#Preparing census80
+census80 = read.table("C:\\Users\\ttrap\\Desktop\\stat156\\Final Project\\census80.Rda")
+
+census80 = census80 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+```{r}
+#Preparing census70
+census70 = read.table("C:\\Users\\ttrap\\Desktop\\stat156\\Final Project\\census70.Rda")
+census70 = census70 %>% 
+      filter(!is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+```{r}
+#Preparing census90 and census2000
+census90 = read.table("C:\\Users\\ttrap\\Desktop\\stat156\\Final Project\\census90.Rda")
+census90 = census90 %>% 
+      filter(!is.na(hsdrop), !is.na(hsgrad), !is.na(anycol), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+
+census2000 = read.table("C:\\Users\\ttrap\\Desktop\\stat156\\Final Project\\census2000.Rda")
+census2000 = census2000 %>% 
+      filter(!is.na(lnhrwage), !is.na(working), !is.na(inpov), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+```
+
+```{r}
+#Defining relevant control variables/covariates
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+
+controls902000 = c("blacknh", 'othernh', 'hispanic', 
+                  'female', 'hspercap', 'start66', 'start67', 'start68', 'start69', 
+                  'start70', 'start71', 'start72', 'start73', 'start74')
+```
+
+# Summary Statistic Tables
+
+## census80
+
+```{r}
+stargazer(census80[, c("gradeage", "preschlcov", "covst6768", 
+                       "covst69", "covst7072", "covst7374")], 
+          summary.stat = c("mean", "sd", "p25", "median", "p75", "max", "n"))
+```
+
+```{r}
+stargazer(census90[, c("hsdrop", "hsgrad", "anycol", "preschlcov", "covst6768", 
+                       "covst69", "covst7072", "covst7374")], 
+          summary.stat = c("mean", "sd", "p25", "median", "p75", "max", "n"))
+```
+
+```{r}
+stargazer(census2000[, c('lnhrwage', 'working', 'inpov', "preschlcov", "covst6768", 
+                       "covst69", "covst7072", "covst7374")], 
+          summary.stat = c("mean", "sd", "p25", "median", "p75", "max", "n"))
+```
+
+```{r}
+#Table 3
+vars_summary_table <- xtable(vars_summary, digits = 3)
+
+# Print LaTeX code
+print(vars_summary_table, include.rownames = TRUE, caption.placement = "top", booktabs = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

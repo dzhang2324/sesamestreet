@@ -1,0 +1,274 @@
+---
+title: "STAT 156 Final Project: Replicating Table 4-6"
+output: html_document
+date: "2023-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Libraries
+
+```{r}
+library(tidyverse)
+library(plm)
+library(haven)
+library(estimatr)
+library(parallel)
+```
+
+# Table 4
+
+```{r}
+#Loading census80
+census80 = read.table("C:\\Users\\ttrap\\Downloads\\census80.Rda")
+head(census80)
+```
+
+```{r}
+#Defining control variables and empty matrices to store coefficients
+controls <- c("momhsdrop2", "momhsgrad2", "livwmom", "blacknh", "othernh", "hispanic", 
+              "female", "hspercap", "fsage6", "fsage0_6", "start66", "start67", 
+              "start68", "start69", "start70", "start71", "start72", "start73", "start74")
+
+census4a <- matrix(NA, nrow = 4, ncol = 6)
+census4b <- matrix(NA, nrow = 9, ncol = 6)
+```
+
+### Run panel regressions for each group, collect coefficient estimates and store them in matrices
+
+```{r}
+groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+group_names = names(groups)
+
+for (i in 1:length(groups)) {
+  group_name = group_names[i]
+  group_condition <- groups[[group_name]]
+  
+  group_data = filter(census80, !!group_condition)
+  
+  # Estimate the FE model
+  model_1 <- plm(as.formula(paste("gradeage ~ preschlcov +", paste(controls, collapse = " + "))), 
+                   data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census4a[1, i] <- coef(model_1)["preschlcov"]
+  census4a[3, i] <- nobs(model_1)
+  census4a[4, i] <- mean(model_1$residuals)
+  
+  model_2 <- plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  census4b[1, i] <- coef(model_2)["covst6768"]
+  census4b[3, i] <- coef(model_2)["covst69"]
+  census4b[5, i] <- coef(model_2)["covst7072"]
+  census4b[7, i] <- coef(model_2)["covst7374"]
+  census4b[9, i] <- nobs(model_2)
+}
+```
+
+```{r}
+#Debugging
+#summary(plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), data = group_data, index = c("statecty", "statecohort"), model = "within"))
+
+#Bug fixed!
+```
+
+```{r}
+#covst69 has only 0 or NA
+#unique(census80[, 'covst69'])
+
+#covst7374 only has 0 or NA
+#unique(census80[, 'covst7374'])
+
+#Bug fixed!
+```
+
+## Bootstrapping S.E.
+
+Required Data:
+
+stage1_sample.rda - for boostrapping the simulated coverage rates stage2_sample.rda census80.rda - this is the data to estimate the regressions
+
+```{r}
+#Checking the data out
+stage2_sample = read.table("C:\\Users\\ttrap\\Downloads\\stage2_sample.Rda")
+#unique(stage2_sample[, 'hgtground'])
+
+stage1_sample = read.table("C:\\Users\\ttrap\\Downloads\\stage1_sample.Rda")
+```
+
+General algorithm:
+
+1.  Bootstrap sample from stage1_sample, clustering on stationid.
+
+(This means that we random sample only with respect to stationid. If we get a particular stationid, we take all observations with that stationid. The number of samples drawn is equal to the number of unique stationids. )
+
+2.  Run OLS to simulate the coverage rate.
+
+Estimate coverage rate (covratehat) for each row, divide by 100. For rows with distance \> 20, replace with 0. If covratehat is negative, also replace with 0.
+
+I am choosing to only get the predicted coverage rate, and not doing everything else that is in predict_cov.do.
+
+Due to computational restraints, we have to do subsample clustered bootstrapping. Although there may be asymptotic results published somewhere, the results are unknown to us, and are somewhat out of scope of this replication. Nonetheless, we proceed with the following algorithm:
+
+1.  Choose a total sample size $n$ (we will choose $n = 10,000$).
+2.  Calculate the proportions of data points in each cluster, denoted as $p_k$.
+3.  For each cluster $k$, randomly sample with replacement $p_kn$ data points, rounding up to the nearest integer.
+4.  Proceed with the bootstrapping/estimation procedure as usual.
+
+```{r}
+#Clustered subsample function
+#Input: dataframe, cluster name, size of sample. Returns dataframe of the sample
+
+subsample_clust <- function(data, cluster_variable, n) {
+  
+  #Empty dataframe to put samples
+  subsample <- data.frame()
+  
+  #Calculate proportion of each cluster
+  cluster_proportions = table(data[[cluster_variable]])/nrow(data)
+  
+  for (cluster in unique(data[[cluster_variable]])) {
+  
+  #Calculate cluster size to sample, round to nearest integer
+  p_k = cluster_proportions[[as.character(cluster)]]
+  cluster_size = round(p_k * n)
+  
+  #Filter for observations in cluster
+  cluster_data <- filter(data, cluster_variable == cluster)
+  
+  # Sample from the current cluster
+  sampled_data <- cluster_data[sample(nrow(cluster_data), cluster_size, replace = TRUE), ]
+  
+  # Append the sampled data to the subsample
+  subsample <- rbind(subsample, sampled_data)
+  }
+  
+  return(subsample)
+}
+```
+
+```{r}
+#Bootstrap function, copy and paste the whole thing
+
+bootstrapcensus4_dma <- function(stage1, stage2, census, reps) {
+  
+  #Initialize matrices of coefficients
+  #1st col: coef of model_1, 2nd col: covst6768, 3rd col: covst69, 4th col: covst7072, 5th col: covst7374
+  coef_mat = matrix(0, nrow = reps, ncol = 5)
+  
+  #1st is all, 2nd is male, 3rd is girls, 4 is white, 5 is black, 6 is hispanic
+  mat_list = list(coef_mat, coef_mat, coef_mat, 
+                  coef_mat, coef_mat, coef_mat)
+  
+  for (r in 1:reps) {
+  
+  #First Stage - bootstrap sampling from stage1_sample
+  #s1_sample = subsample_clust(stage1, stationid, 10000)
+  
+  num_stationids = length(unique(stage1$stationid))
+  selected_clusters <- sample(unique(stage1$stationid), 
+                              size = num_stationids, replace = TRUE)
+  s1_sample = stage1 %>% 
+    filter(stationid %in% selected_clusters)
+  
+  #Model to estimate covratehat
+  covrate_model <- lm_robust(covrate2 ~ distance + uhf + dist_uhf + hgtground + power_vis, 
+                      data = s1_sample,
+                      weights = totalhh,
+                      clusters = stationid)
+  
+  #Second Stage - get covratehat and bootstrap sample
+  predicted_cov = stage2
+  
+  predicted_cov = predicted_cov %>% 
+    mutate(covratehat = predict(covrate_model, newdata = .)/100) %>%
+    mutate(covratehat = ifelse((covratehat < 0) | (distance > 20), 0, covratehat)) %>%
+    rename(stfips = stfips_hh, ctyfips = ctyfips_hh)
+  
+  predicted_cov = predicted_cov %>% 
+    mutate(statecty = 1000*stfips+ctyfips) %>% 
+    mutate(statecty = ifelse(statecty == 12025, 12086, statecty)) #Not sure why this is here, but its
+                                                                  #in the .do file
+  #Define groups for regressions
+  groups <- list(all = quote(TRUE), male = quote(female == 0), female = quote(female == 1), 
+               white = quote(whitenh == 1), black = quote(blacknh == 1), hispanic = quote(hispanic == 1))
+
+  group_names = names(groups)
+
+  for (i in 1:length(groups)) {
+    group_name = group_names[i]
+    group_condition <- groups[[group_name]]
+  
+    #Get all observations in census group where covariates are not NA and in group_condition
+    group_data = census %>% 
+      filter(!!group_condition, !is.na(gradeage), !is.na(preschlcov), !is.na(presch169),
+           !is.na(covratehat), !is.na(covst6768), !is.na(covst69), !is.na(covst7072), !is.na(covst7374))
+    
+    #We need to drop all of the coverage variables before we draw BS sample
+    group_data = group_data %>%
+      select(-covratehat, -preschlcov, -starts_with("covst"))
+    
+    #Clustered sample of group_data
+    group_sample = subsample_clust(group_data, "dmaindex", 10000)
+    
+    #num_dmaindex = length(unique(group_data$dmaindex))
+    #group_data_clusters <- sample(unique(group_data$dmaindex), 
+                              #size = num_dmaindex, replace = TRUE)
+    #group_sample = group_data %>% 
+    #filter(dmaindex %in% selected_clusters)
+    
+    #Merging dataframes
+    #The line "keep if censustocov == 3" means to keep all merged rows that were in predicted_cov
+    cov_census = left_join(group_sample, predicted_cov, by = "statecty", unmatched = "drop")
+    cov_census = cov_census %>% 
+      filter(!is.na(statecty))
+    
+    #Generate the Coverage variables
+    cov_census = cov_census %>%
+      mutate(preschlcov = presch169*covratehat)
+
+    # Use dplyr to create covstyr columns
+    years <- 65:74
+    for (yr in years) {
+    start_col <- paste("start", yr, sep = "")
+    covstyr_col <- paste("covst", yr, sep = "")
+    cov_census[[covstyr_col]] <- cov_census$covratehat * cov_census[[start_col]]
+    }
+    
+    cov_census = cov_census %>% 
+      mutate(covst6768 = covratehat*start6768, 
+             covst7072 = covratehat*start7072,
+             covst7374 = covratehat*start7374)
+    
+    #Estimate regressions
+    model_1 <- plm(as.formula(paste("gradeage ~ preschlcov +", paste(controls, collapse = " + "))), 
+                   data = group_data, index = c("statecty", "statecohort"), model = "within")
+    
+    model_2 <- plm(as.formula(paste("gradeage ~ covst6768 + covst69 + covst7072 + covst7374 + covratehat +", paste(controls, collapse = " + "))), data = group_data, index = c("statecty", "statecohort"), model = "within")
+  
+  coef_vec = c(coef(model_1)["preschlcov"], coef(model_2)["covst6768"], coef(model_2)["covst69"], 
+               coef(model_2)["covst7072"], coef(model_2)["covst7374"])
+  
+  #Get ith matrix, replace rth row with coef_vec
+  mat_list[[i]][r, ] = coef_vec
+    
+    }
+  }
+  return(mat_list)
+}
+```
+
+```{r}
+#Test run
+bootstrapcensus4_dma(stage1_sample, stage2_sample, census80, 5)
+```
+
+Try changing the function to create matrices of coefficents, where each column represents
+
+```{r}
+#Debugging 
+
+```
