@@ -1,5 +1,4 @@
 # sesamestreet
-STAT 156/256 - Causal Inference (UC Berkeley) Final Project Replication Code/Write-Up
 
 Replication Code/Paper for Kearney and Levine (2019): Early Childhood Education by Television: Lessons from Sesame Street. Link to the original paper: https://www.aeaweb.org/articles?id=10.1257/app.20170300
 
