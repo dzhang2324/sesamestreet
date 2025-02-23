@@ -2,7 +2,7 @@
 
 Replication Code/Paper for Kearney and Levine (2019): Early Childhood Education by Television: Lessons from Sesame Street. Link to the original paper: https://www.aeaweb.org/articles?id=10.1257/app.20170300
 
-This repository represents my share of the work for a final project in STAT156/256 - Causal Inference (UC Berkeley), done with one other person. I replcate the results in the paper, which are the estimations of two fixed effects regressions, and reanalyze the data in the paper utilizing AIPW/Doubly Robust estimators to estimate the causal effect of interest. All replications are done in R. 
+This repository represents my share of the work for a final project in STAT156/256 - Causal Inference (UC Berkeley), done with one other person. I replcate the results in the paper, which are the estimations of two fixed effects regressions, and reanalyze the data in the paper utilizing AIPW/Doubly Robust estimators to estimate the causal effect of interest. All replications are done in R. The write-up is written entirely by me. 
 
 This paper utilizes census data. It is too large to upload onto GitHub, so the data can be found here: https://drive.google.com/drive/folders/1eYZjPuEdySHfdMZuUBPZeJT6htCw87t-?usp=sharing. Use read.table in R to read the data. 
 
